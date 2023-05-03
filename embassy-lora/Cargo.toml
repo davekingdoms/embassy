@@ -31,4 +31,4 @@ embedded-hal = { version = "0.2", features = ["unproven"] }
 bit_field = { version = "0.10" }
 
 lora-phy = { version = "1" }
-lorawan-device = { version = "0.10.0",git = "https://github.com/davekingdoms/embassy.git", default-features = false, features = ["async"] }
+lorawan-device = { version = "0.10.0",git = "https://github.com/davekingdoms/rust-lorawan.git", default-features = false, features = ["async"] }
