@@ -4,12 +4,12 @@
 
 use core::fmt::Write;
 
+use embassy_embedded_hal::SetConfig;
 use embassy_executor::Spawner;
 use embassy_rp::dma::{AnyChannel, Channel};
-use embassy_rp::gpio::Pin;
 use embassy_rp::peripherals::PIO0;
-use embassy_rp::pio::{FifoJoin, Pio, PioStateMachine, PioStateMachineInstance, ShiftDirection};
-use embassy_rp::pwm::{Config, Pwm};
+use embassy_rp::pio::{Config, Direction, FifoJoin, Pio, PioPin, ShiftConfig, ShiftDirection, StateMachine};
+use embassy_rp::pwm::{self, Pwm};
 use embassy_rp::relocate::RelocatedProgram;
 use embassy_rp::{into_ref, Peripheral, PeripheralRef};
 use embassy_time::{Duration, Instant, Timer};
@@ -30,7 +30,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let _pwm = Pwm::new_output_b(p.PWM_CH7, p.PIN_15, {
-        let mut c = Config::default();
+        let mut c = pwm::Config::default();
         c.divider = 125.into();
         c.top = 100;
         c.compare_b = 50;
@@ -65,7 +65,7 @@ async fn main(_spawner: Spawner) {
 
 pub struct HD44780<'l> {
     dma: PeripheralRef<'l, AnyChannel>,
-    sm: PioStateMachineInstance<'l, PIO0, 0>,
+    sm: StateMachine<'l, PIO0, 0>,
 
     buf: [u8; 40],
 }
@@ -74,25 +74,28 @@ impl<'l> HD44780<'l> {
     pub async fn new(
         pio: impl Peripheral<P = PIO0> + 'l,
         dma: impl Peripheral<P = impl Channel> + 'l,
-        rs: impl Pin,
-        rw: impl Pin,
-        e: impl Pin,
-        db4: impl Pin,
-        db5: impl Pin,
-        db6: impl Pin,
-        db7: impl Pin,
+        rs: impl PioPin,
+        rw: impl PioPin,
+        e: impl PioPin,
+        db4: impl PioPin,
+        db5: impl PioPin,
+        db6: impl PioPin,
+        db7: impl PioPin,
     ) -> HD44780<'l> {
         into_ref!(dma);
 
-        let db7pin = db7.pin();
         let Pio {
-            mut common, mut sm0, ..
+            mut common,
+            mut irq0,
+            mut sm0,
+            ..
         } = Pio::new(pio);
 
         // takes command words (<wait:24> <command:4> <0:4>)
         let prg = pio_proc::pio_asm!(
             r#"
                 .side_set 1 opt
+                .origin 20
 
                 loop:
                     out x,     24
@@ -113,47 +116,40 @@ impl<'l> HD44780<'l> {
         let db6 = common.make_pio_pin(db6);
         let db7 = common.make_pio_pin(db7);
 
-        sm0.set_set_pins(&[&rs, &rw]);
-        embassy_rp::pio_instr_util::set_pindir(&mut sm0, 0b11);
-        sm0.set_set_pins(&[&e]);
-        embassy_rp::pio_instr_util::set_pindir(&mut sm0, 0b1);
-        sm0.set_set_pins(&[&db4, &db5, &db6, &db7]);
-        embassy_rp::pio_instr_util::set_pindir(&mut sm0, 0b11111);
+        sm0.set_pin_dirs(Direction::Out, &[&rs, &rw, &e, &db4, &db5, &db6, &db7]);
 
         let relocated = RelocatedProgram::new(&prg.program);
-        common.write_instr(relocated.origin() as usize, relocated.code());
-        embassy_rp::pio_instr_util::exec_jmp(&mut sm0, relocated.origin());
-        sm0.set_clkdiv(125 * 256);
-        let pio::Wrap { source, target } = relocated.wrap();
-        sm0.set_wrap(source, target);
-        sm0.set_side_enable(true);
-        sm0.set_out_pins(&[&db4, &db5, &db6, &db7]);
-        sm0.set_sideset_base_pin(&e);
-        sm0.set_sideset_count(2);
-        sm0.set_out_shift_dir(ShiftDirection::Left);
-        sm0.set_fifo_join(FifoJoin::TxOnly);
-        sm0.set_autopull(true);
-        sm0.set_pull_threshold(32);
+        let mut cfg = Config::default();
+        cfg.use_program(&common.load_program(&relocated), &[&e]);
+        cfg.clock_divider = 125u8.into();
+        cfg.set_out_pins(&[&db4, &db5, &db6, &db7]);
+        cfg.shift_out = ShiftConfig {
+            auto_fill: true,
+            direction: ShiftDirection::Left,
+            threshold: 32,
+        };
+        cfg.fifo_join = FifoJoin::TxOnly;
+        sm0.set_config(&cfg);
 
         sm0.set_enable(true);
         // init to 8 bit thrice
-        sm0.push_tx((50000 << 8) | 0x30);
-        sm0.push_tx((5000 << 8) | 0x30);
-        sm0.push_tx((200 << 8) | 0x30);
+        sm0.tx().push((50000 << 8) | 0x30);
+        sm0.tx().push((5000 << 8) | 0x30);
+        sm0.tx().push((200 << 8) | 0x30);
         // init 4 bit
-        sm0.push_tx((200 << 8) | 0x20);
+        sm0.tx().push((200 << 8) | 0x20);
         // set font and lines
-        sm0.push_tx((50 << 8) | 0x20);
-        sm0.push_tx(0b1100_0000);
+        sm0.tx().push((50 << 8) | 0x20);
+        sm0.tx().push(0b1100_0000);
 
-        sm0.wait_irq(0).await;
+        irq0.wait().await;
         sm0.set_enable(false);
 
         // takes command sequences (<rs:1> <count:7>, data...)
         // many side sets are only there to free up a delay bit!
         let prg = pio_proc::pio_asm!(
             r#"
-                .origin 7
+                .origin 27
                 .side_set 1
 
                 .wrap_target
@@ -197,24 +193,20 @@ impl<'l> HD44780<'l> {
         );
 
         let relocated = RelocatedProgram::new(&prg.program);
-        common.write_instr(relocated.origin() as usize, relocated.code());
-        embassy_rp::pio_instr_util::exec_jmp(&mut sm0, relocated.origin());
-        let pio::Wrap { source, target } = relocated.wrap();
-        sm0.set_clkdiv(8 * 256); // ~64ns/insn
-        sm0.set_side_enable(false);
-        sm0.set_jmp_pin(db7pin);
-        sm0.set_wrap(source, target);
-        sm0.set_set_pins(&[&rs, &rw]);
-        sm0.set_out_pins(&[&db4, &db5, &db6, &db7]);
-        sm0.set_sideset_base_pin(&e);
-        sm0.set_sideset_count(1);
-        sm0.set_out_shift_dir(ShiftDirection::Left);
-        sm0.set_fifo_join(FifoJoin::TxOnly);
+        let mut cfg = Config::default();
+        cfg.use_program(&common.load_program(&relocated), &[&e]);
+        cfg.clock_divider = 8u8.into(); // ~64ns/insn
+        cfg.set_jmp_pin(&db7);
+        cfg.set_set_pins(&[&rs, &rw]);
+        cfg.set_out_pins(&[&db4, &db5, &db6, &db7]);
+        cfg.shift_out.direction = ShiftDirection::Left;
+        cfg.fifo_join = FifoJoin::TxOnly;
+        sm0.set_config(&cfg);
 
         sm0.set_enable(true);
 
         // display on and cursor on and blinking, reset display
-        sm0.dma_push(dma.reborrow(), &[0x81u8, 0x0f, 1]).await;
+        sm0.tx().dma_push(dma.reborrow(), &[0x81u8, 0x0f, 1]).await;
 
         Self {
             dma: dma.map_into(),
@@ -238,6 +230,6 @@ impl<'l> HD44780<'l> {
         // set cursor to 1:15
         self.buf[38..].copy_from_slice(&[0x80, 0xcf]);
 
-        self.sm.dma_push(self.dma.reborrow(), &self.buf).await;
+        self.sm.tx().dma_push(self.dma.reborrow(), &self.buf).await;
     }
 }
