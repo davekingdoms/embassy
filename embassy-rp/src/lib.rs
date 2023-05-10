@@ -131,28 +131,63 @@ embassy_hal_common::peripherals! {
     WATCHDOG,
 }
 
-#[link_section = ".boot2"]
-#[used]
-static BOOT2: [u8; 256] = *include_bytes!("boot2.bin");
+macro_rules! select_bootloader {
+    ( $( $feature:literal => $loader:ident, )+ default => $default:ident ) => {
+        $(
+            #[cfg(feature = $feature)]
+            #[link_section = ".boot2"]
+            #[used]
+            static BOOT2: [u8; 256] = rp2040_boot2::$loader;
+        )*
+
+        #[cfg(not(any( $( feature = $feature),* )))]
+        #[link_section = ".boot2"]
+        #[used]
+        static BOOT2: [u8; 256] = rp2040_boot2::$default;
+    }
+}
+
+select_bootloader! {
+    "boot2-at25sf128a" => BOOT_LOADER_AT25SF128A,
+    "boot2-gd25q64cs" => BOOT_LOADER_GD25Q64CS,
+    "boot2-generic-03h" => BOOT_LOADER_GENERIC_03H,
+    "boot2-is25lp080" => BOOT_LOADER_IS25LP080,
+    "boot2-ram-memcpy" => BOOT_LOADER_RAM_MEMCPY,
+    "boot2-w25q080" => BOOT_LOADER_W25Q080,
+    "boot2-w25x10cl" => BOOT_LOADER_W25X10CL,
+    default => BOOT_LOADER_W25Q080
+}
 
 pub mod config {
+    use crate::clocks::ClockConfig;
+
     #[non_exhaustive]
-    pub struct Config {}
+    pub struct Config {
+        pub clocks: ClockConfig,
+    }
 
     impl Default for Config {
         fn default() -> Self {
-            Self {}
+            Self {
+                clocks: ClockConfig::crystal(12_000_000),
+            }
+        }
+    }
+
+    impl Config {
+        pub fn new(clocks: ClockConfig) -> Self {
+            Self { clocks }
         }
     }
 }
 
-pub fn init(_config: config::Config) -> Peripherals {
+pub fn init(config: config::Config) -> Peripherals {
     // Do this first, so that it panics if user is calling `init` a second time
     // before doing anything important.
     let peripherals = Peripherals::take();
 
     unsafe {
-        clocks::init();
+        clocks::init(config.clocks);
         #[cfg(feature = "time-driver")]
         timer::init();
         dma::init();
