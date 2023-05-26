@@ -206,13 +206,14 @@ fn main() {
                 erase_size: #erase_size,
                 write_size: #write_size,
                 erase_value: #erase_value,
+                _ensure_internal: (),
             };
         });
 
         let region_type = format_ident!("{}", get_flash_region_type_name(region.name));
         flash_regions.extend(quote! {
             #[cfg(flash)]
-            pub struct #region_type<'d>(pub &'static crate::flash::FlashRegion, pub(crate) embassy_hal_common::PeripheralRef<'d, crate::peripherals::FLASH>,);
+            pub struct #region_type<'d, MODE = crate::flash::Async>(pub &'static crate::flash::FlashRegion, pub(crate) embassy_hal_common::PeripheralRef<'d, crate::peripherals::FLASH>, pub(crate) core::marker::PhantomData<MODE>);
         });
     }
 
@@ -223,11 +224,11 @@ fn main() {
             let field_name = format_ident!("{}", region_name.to_lowercase());
             let field_type = format_ident!("{}", get_flash_region_type_name(f.name));
             let field = quote! {
-                pub #field_name: #field_type<'d>
+                pub #field_name: #field_type<'d, MODE>
             };
             let region_name = format_ident!("{}", region_name);
             let init = quote! {
-                #field_name: #field_type(&#region_name, unsafe { p.clone_unchecked()})
+                #field_name: #field_type(&#region_name, unsafe { p.clone_unchecked()}, core::marker::PhantomData)
             };
 
             (field, (init, region_name))
@@ -237,15 +238,17 @@ fn main() {
     let regions_len = flash_memory_regions.len();
     flash_regions.extend(quote! {
         #[cfg(flash)]
-        pub struct FlashLayout<'d> {
-            #(#fields),*
+        pub struct FlashLayout<'d, MODE = crate::flash::Async> {
+            #(#fields),*,
+            _mode: core::marker::PhantomData<MODE>,
         }
 
         #[cfg(flash)]
-        impl<'d> FlashLayout<'d> {
+        impl<'d, MODE> FlashLayout<'d, MODE> {
             pub(crate) fn new(p: embassy_hal_common::PeripheralRef<'d, crate::peripherals::FLASH>) -> Self {
                 Self {
-                    #(#inits),*
+                    #(#inits),*,
+                    _mode: core::marker::PhantomData,
                 }
             }
         }
@@ -420,6 +423,10 @@ fn main() {
         (("spi", "SCK"), quote!(crate::spi::SckPin)),
         (("spi", "MOSI"), quote!(crate::spi::MosiPin)),
         (("spi", "MISO"), quote!(crate::spi::MisoPin)),
+        (("spi", "NSS"), quote!(crate::spi::CsPin)),
+        (("spi", "I2S_MCK"), quote!(crate::spi::MckPin)),
+        (("spi", "I2S_CK"), quote!(crate::spi::CkPin)),
+        (("spi", "I2S_WS"), quote!(crate::spi::WsPin)),
         (("i2c", "SDA"), quote!(crate::i2c::SdaPin)),
         (("i2c", "SCL"), quote!(crate::i2c::SclPin)),
         (("rcc", "MCO_1"), quote!(crate::rcc::McoPin)),

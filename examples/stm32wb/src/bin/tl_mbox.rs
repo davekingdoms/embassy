@@ -6,8 +6,14 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::ipcc::{Config, Ipcc};
 use embassy_stm32::tl_mbox::TlMbox;
+use embassy_stm32::{bind_interrupts, tl_mbox};
 use embassy_time::{Duration, Timer};
 use {defmt_rtt as _, panic_probe as _};
+
+bind_interrupts!(struct Irqs{
+    IPCC_C1_RX => tl_mbox::ReceiveInterruptHandler;
+    IPCC_C1_TX => tl_mbox::TransmitInterruptHandler;
+});
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -27,6 +33,7 @@ async fn main(_spawner: Spawner) {
         - Once complete, in the Release_Notes.html, find the memory address that corresponds to your device for the
           stm32wb5x_BLE_Stack_full_fw.bin file. It should not be the same memory address.
         - Select that file, the memory address, "verify download", and then "Firmware Upgrade".
+        - Select "Start Wireless Stack".
         - Disconnect from the device.
         - In the examples folder for stm32wb, modify the memory.x file to match your target device.
         - Run this example.
@@ -40,7 +47,7 @@ async fn main(_spawner: Spawner) {
     let config = Config::default();
     let mut ipcc = Ipcc::new(p.IPCC, config);
 
-    let mbox = TlMbox::init(&mut ipcc);
+    let mbox = TlMbox::init(&mut ipcc, Irqs);
 
     loop {
         let wireless_fw_info = mbox.wireless_fw_info();
