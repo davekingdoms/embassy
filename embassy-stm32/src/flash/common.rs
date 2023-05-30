@@ -30,7 +30,7 @@ impl<'d> Flash<'d, Blocking> {
 
 impl<'d, MODE> Flash<'d, MODE> {
     pub fn into_blocking_regions(self) -> FlashLayout<'d, Blocking> {
-        family::set_default_layout();
+        assert!(family::is_default_layout());
         FlashLayout::new(self.inner)
     }
 
@@ -163,7 +163,7 @@ pub(super) fn get_sector(address: u32, regions: &[&FlashRegion]) -> FlashSector 
             bank_offset = 0;
         }
 
-        if address < region.end() {
+        if address >= region.base && address < region.end() {
             let index_in_region = (address - region.base) / region.erase_size;
             return FlashSector {
                 bank: region.bank,

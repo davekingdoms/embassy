@@ -13,6 +13,12 @@ use futures::future::{select, Either};
 use crate::dma::{NoDma, Transfer};
 use crate::gpio::sealed::AFType;
 #[cfg(not(any(usart_v1, usart_v2)))]
+#[allow(unused_imports)]
+use crate::pac::usart::regs::Isr as Sr;
+#[cfg(any(usart_v1, usart_v2))]
+#[allow(unused_imports)]
+use crate::pac::usart::regs::Sr;
+#[cfg(not(any(usart_v1, usart_v2)))]
 use crate::pac::usart::Lpuart as Regs;
 #[cfg(any(usart_v1, usart_v2))]
 use crate::pac::usart::Usart as Regs;
@@ -32,7 +38,6 @@ impl<T: BasicInstance> interrupt::Handler<T::Interrupt> for InterruptHandler<T> 
 
         let (sr, cr1, cr3) = unsafe { (sr(r).read(), r.cr1().read(), r.cr3().read()) };
 
-        let mut wake = false;
         let has_errors = (sr.pe() && cr1.peie()) || ((sr.fe() || sr.ne() || sr.ore()) && cr3.eie());
         if has_errors {
             // clear all interrupts and DMA Rx Request
@@ -52,35 +57,24 @@ impl<T: BasicInstance> interrupt::Handler<T::Interrupt> for InterruptHandler<T> 
                     w.set_dmar(false);
                 });
             }
+        } else if cr1.idleie() && sr.idle() {
+            // IDLE detected: no more data will come
+            unsafe {
+                r.cr1().modify(|w| {
+                    // disable idle line detection
+                    w.set_idleie(false);
+                });
+            }
+        } else if cr1.rxneie() {
+            // We cannot check the RXNE flag as it is auto-cleared by the DMA controller
 
-            wake = true;
+            // It is up to the listener to determine if this in fact was a RX event and disable the RXNE detection
         } else {
-            if cr1.idleie() && sr.idle() {
-                // IDLE detected: no more data will come
-                unsafe {
-                    r.cr1().modify(|w| {
-                        // disable idle line detection
-                        w.set_idleie(false);
-                    });
-                }
-
-                wake = true;
-            }
-
-            if cr1.rxneie() {
-                // We cannot check the RXNE flag as it is auto-cleared by the DMA controller
-
-                // It is up to the listener to determine if this in fact was a RX event and disable the RXNE detection
-
-                wake = true;
-            }
+            return;
         }
 
-        if wake {
-            compiler_fence(Ordering::SeqCst);
-
-            s.rx_waker.wake();
-        }
+        compiler_fence(Ordering::SeqCst);
+        s.rx_waker.wake();
     }
 }
 
@@ -120,6 +114,12 @@ pub struct Config {
     /// read will abort, the error reported and cleared
     /// if false, the error is ignored and cleared
     pub detect_previous_overrun: bool,
+
+    /// Set this to true if the line is considered noise free.
+    /// This will increase the receivers tolerance to clock deviations,
+    /// but will effectively disable noise detection.
+    #[cfg(not(usart_v1))]
+    pub assume_noise_free: bool,
 }
 
 impl Default for Config {
@@ -131,6 +131,8 @@ impl Default for Config {
             parity: Parity::ParityNone,
             // historical behavior
             detect_previous_overrun: false,
+            #[cfg(not(usart_v1))]
+            assume_noise_free: false,
         }
     }
 }
@@ -828,11 +830,17 @@ fn configure(r: Regs, config: &Config, pclk_freq: Hertz, kind: Kind, enable_rx: 
 
     #[cfg(not(usart_v1))]
     let mut over8 = false;
-    let mut found = false;
+    let mut found = None;
     for &(presc, _presc_val) in &DIVS {
         let denom = (config.baudrate * presc as u32) as u64;
         let div = (pclk_freq.0 as u64 * mul + (denom / 2)) / denom;
-        trace!("USART: presc={} div={:08x}", presc, div);
+        trace!(
+            "USART: presc={}, div=0x{:08x} (mantissa = {}, fraction = {})",
+            presc,
+            div,
+            div >> 4,
+            div & 0x0F
+        );
 
         if div < brr_min {
             #[cfg(not(usart_v1))]
@@ -844,24 +852,36 @@ fn configure(r: Regs, config: &Config, pclk_freq: Hertz, kind: Kind, enable_rx: 
                     #[cfg(usart_v4)]
                     r.presc().write(|w| w.set_prescaler(_presc_val));
                 }
-                found = true;
+                found = Some(div);
                 break;
             }
             panic!("USART: baudrate too high");
         }
 
         if div < brr_max {
+            let div = div as u32;
             unsafe {
-                r.brr().write_value(regs::Brr(div as u32));
+                r.brr().write_value(regs::Brr(div));
                 #[cfg(usart_v4)]
                 r.presc().write(|w| w.set_prescaler(_presc_val));
             }
-            found = true;
+            found = Some(div);
             break;
         }
     }
 
-    assert!(found, "USART: baudrate too low");
+    let div = found.expect("USART: baudrate too low");
+
+    #[cfg(not(usart_v1))]
+    let oversampling = if over8 { "8 bit" } else { "16 bit" };
+    #[cfg(usart_v1)]
+    let oversampling = "default";
+    trace!(
+        "Using {} oversampling, desired baudrate: {}, actual baudrate: {}",
+        oversampling,
+        config.baudrate,
+        pclk_freq.0 / div
+    );
 
     unsafe {
         r.cr2().write(|w| {
@@ -894,6 +914,11 @@ fn configure(r: Regs, config: &Config, pclk_freq: Hertz, kind: Kind, enable_rx: 
             });
             #[cfg(not(usart_v1))]
             w.set_over8(vals::Over8(over8 as _));
+        });
+
+        #[cfg(not(usart_v1))]
+        r.cr3().modify(|w| {
+            w.set_onebit(config.assume_noise_free);
         });
     }
 }
@@ -1078,9 +1103,9 @@ pub use crate::usart::buffered::InterruptHandler as BufferedInterruptHandler;
 mod buffered;
 
 #[cfg(not(gpdma))]
-mod rx_ringbuffered;
+mod ringbuffered;
 #[cfg(not(gpdma))]
-pub use rx_ringbuffered::RingBufferedUartRx;
+pub use ringbuffered::RingBufferedUartRx;
 
 use self::sealed::Kind;
 
